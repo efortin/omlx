@@ -2765,6 +2765,7 @@ async def create_completion(
                 xtc_threshold=xtc_threshold,
                 stop=request.stop,
                 seed=request.seed,
+                thinking_budget=_resolve_thinking_budget(request, request.model),
             )
 
             choices.append(
@@ -3761,6 +3762,7 @@ async def stream_completion(
             xtc_threshold=xtc_threshold,
             stop=request.stop,
             seed=request.seed,
+            thinking_budget=_resolve_thinking_budget(request, request.model),
         ):
             if first_token_time is None and output.new_text:
                 first_token_time = time.perf_counter()

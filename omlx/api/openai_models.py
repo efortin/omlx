@@ -396,6 +396,10 @@ class CompletionRequest(BaseModel):
     frequency_penalty: float | None = None
     # Seed for reproducible generation (best-effort)
     seed: Optional[int] = None
+    # Thinking budget (max thinking tokens, None = unlimited); same
+    # extension as ChatCompletionRequest. Useful with raw prompts that
+    # open a thinking block (e.g. ending with "<think>\n").
+    thinking_budget: Optional[int] = None
 
     @field_validator("stop", mode="before")
     @classmethod
