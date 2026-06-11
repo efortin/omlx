@@ -299,7 +299,7 @@ class ChatCompletionRequest(BaseModel):
     # Chat template kwargs (e.g. enable_thinking, reasoning_effort)
     chat_template_kwargs: Optional[Dict[str, Any]] = None
     # Thinking budget (max thinking tokens, None = unlimited)
-    thinking_budget: Optional[int] = None
+    thinking_budget: Optional[int] = Field(default=None, ge=0)
     # SpecPrefill: per-request enable/disable (None = use model setting)
     specprefill: Optional[bool] = None
     # SpecPrefill: per-request keep percentage (0.1-0.5, None = use model setting)
@@ -399,7 +399,7 @@ class CompletionRequest(BaseModel):
     # Thinking budget (max thinking tokens, None = unlimited); same
     # extension as ChatCompletionRequest. Useful with raw prompts that
     # open a thinking block (e.g. ending with "<think>\n").
-    thinking_budget: Optional[int] = None
+    thinking_budget: Optional[int] = Field(default=None, ge=0)
 
     @field_validator("stop", mode="before")
     @classmethod
