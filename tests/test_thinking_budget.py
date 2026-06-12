@@ -430,3 +430,225 @@ class TestResolveThinkingBudget:
         req = MagicMock(spec=[])
         result = resolve(req, None)
         assert result is None
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
+class TestSoftThinkingBudget:
+    """Unit tests for the progressive soft budget zone (vllm#38277 port)."""
+
+    THINK_END_ID = 42
+    THINK_START_ID = 41
+    BUDGET = 10
+    FRAC = ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC
+    FACTOR = ThinkingBudgetProcessor._SOFT_BIAS_FACTOR
+    SOFT_START = int(BUDGET * FRAC)
+    SPAN = BUDGET - SOFT_START
+
+    def _make_processor(self, budget: int = None, soft_budget: bool = True, end_ids=None):
+        return ThinkingBudgetProcessor(
+            think_end_token_ids=end_ids or [self.THINK_END_ID],
+            budget=self.BUDGET if budget is None else budget,
+            think_start_token_id=self.THINK_START_ID,
+            soft_budget=soft_budget,
+        )
+
+    def _ramp_logits(self, vocab_size: int = 100, top_id: int = 7, top: float = 5.0):
+        """Logits with a known top value and zeros elsewhere."""
+        logits = mx.zeros((1, vocab_size))
+        logits[0, top_id] = top
+        return logits
+
+    def _step(self, proc, n_tokens: int, logits=None):
+        """Run proc for a history of n_tokens generated tokens."""
+        tokens = _make_tokens(*range(10, 10 + n_tokens))
+        return proc(tokens, logits if logits is not None else _make_logits())
+
+    def _expected_boost(self, step: int, top: float = 5.0) -> float:
+        """target - end_logit for a zeroed end logit at a given think step."""
+        if step <= self.SOFT_START:
+            return 0.0
+        progress = (step - self.SOFT_START) / max(1, self.SPAN)
+        return self.FACTOR * max(top, 1.0) * progress
+
+    def test_no_bias_before_soft_zone(self):
+        """Up to the zone boundary, logits pass through unchanged."""
+        proc = self._make_processor()
+        for step in range(1, self.SOFT_START + 1):
+            logits = self._step(proc, step, self._ramp_logits())
+            assert logits[0, self.THINK_END_ID].item() == 0.0
+        assert not proc._forcing
+
+    def test_soft_zone_boosts_end_logit_progressively(self):
+        """Inside the soft zone the close-think logit ramps toward the top."""
+        proc = self._make_processor()
+        boosts = []
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._ramp_logits(top=5.0))
+            boosts.append(logits[0, self.THINK_END_ID].item())
+        assert boosts[self.SOFT_START - 1] == 0.0  # boundary step: progress=0
+        for step in range(self.SOFT_START + 1, self.BUDGET):
+            assert boosts[step - 1] == pytest.approx(self._expected_boost(step))
+        assert boosts[self.BUDGET - 2] > boosts[self.SOFT_START]
+
+    def test_soft_zone_end_dominates_at_high_progress(self):
+        """Past 1/FACTOR of the soft zone the close-think logit exceeds the top."""
+        proc = self._make_processor()
+        logits = None
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._ramp_logits(top=5.0))
+        assert logits[0, self.THINK_END_ID].item() > 5.0
+
+    def test_hard_force_still_applies_at_budget(self):
+        """The 100% hard force stays as the safety net."""
+        proc = self._make_processor()
+        logits = None
+        for step in range(1, self.BUDGET + 1):
+            logits = self._step(proc, step, self._ramp_logits())
+        assert proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+        assert logits[0, 0].item() == float("-inf")
+
+    def test_natural_close_in_soft_zone_stops_biasing(self):
+        """Sampling </think> naturally inside the soft zone ends the ramp."""
+        proc = self._make_processor()
+        in_zone = self.SOFT_START + 1
+        for step in range(1, in_zone):
+            self._step(proc, step, self._ramp_logits())
+        tokens = _make_tokens(*range(10, 10 + in_zone - 1), self.THINK_END_ID)
+        logits = proc(tokens, self._ramp_logits())
+        assert proc._done
+        assert logits[0, self.THINK_END_ID].item() == 0.0  # no further bias
+
+    def test_soft_budget_disabled_keeps_hard_only(self):
+        """soft_budget=False restores the previous hard-cut-only behavior."""
+        proc = self._make_processor(soft_budget=False)
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._ramp_logits())
+            assert logits[0, self.THINK_END_ID].item() == 0.0
+        assert not proc._forcing
+        self._step(proc, self.BUDGET, self._ramp_logits())
+        assert proc._forcing
+
+    def test_multi_token_end_boosts_only_first_id(self):
+        """Without a partial close prefix, only the first marker id is boosted.
+
+        Boosting later ids too could make the model sample them out of
+        order and leak a close-marker fragment into the thinking text.
+        """
+        end_ids = [42, 43]
+        proc = self._make_processor(end_ids=end_ids)
+        logits = None
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._ramp_logits(top=5.0))
+        target = self._expected_boost(self.BUDGET - 1)
+        assert logits[0, 42].item() == pytest.approx(target)
+        assert logits[0, 43].item() == 0.0
+
+    def test_multi_token_partial_prefix_biases_next_id(self):
+        """After the model emits the first marker id, the second is boosted."""
+        end_ids = [42, 43]
+        proc = self._make_processor(end_ids=end_ids)
+        in_zone = self.SOFT_START + 2
+        for step in range(1, in_zone):
+            self._step(proc, step, self._ramp_logits(top=5.0))
+        # Model naturally samples the first id of the close marker.
+        tokens = _make_tokens(*range(10, 10 + in_zone - 1), end_ids[0])
+        logits = proc(tokens, self._ramp_logits(top=5.0))
+        assert not proc._done  # marker not complete yet
+        assert logits[0, 43].item() > 0.0  # continuation id boosted
+        assert logits[0, 42].item() == 0.0  # first id no longer targeted
+
+    def test_min_gap_floor_when_end_already_near_top(self):
+        """gap is floored at 1.0 so the ramp still progresses on flat logits."""
+        proc = self._make_processor()
+        logits = None
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, _make_logits())  # all zeros, gap->1.0
+        progress = (self.BUDGET - 1 - self.SOFT_START) / max(1, self.SPAN)
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * progress)
+
+    def test_multi_token_wrong_prefix_falls_back_to_first_id(self):
+        """A generated tail that matches a LATER marker id (not a proper
+        prefix) must not be treated as a partial close: bias ids[0]."""
+        end_ids = [42, 43]
+        proc = self._make_processor(end_ids=end_ids)
+        in_zone = self.SOFT_START + 2
+        for step in range(1, in_zone):
+            self._step(proc, step, self._ramp_logits(top=5.0))
+        # Model emits the SECOND marker id out of order: not a close prefix.
+        tokens = _make_tokens(*range(10, 10 + in_zone - 1), end_ids[1])
+        logits = proc(tokens, self._ramp_logits(top=5.0))
+        assert not proc._done
+        assert logits[0, 42].item() > 0.0  # first id targeted
+        assert logits[0, 43].item() == 0.0  # out-of-order id not boosted
+
+    @pytest.mark.parametrize(
+        ("end_ids", "recent", "expected"),
+        [
+            # Repeated leading id [A, A, B]: one trailing A is a 1-prefix, a
+            # double A a 2-prefix; an [A, B] tail is NOT a prefix of
+            # [A, A, B], so the bias falls back to ids[0].
+            ([1, 1, 2], [1], 1),
+            ([1, 1, 2], [1, 1], 2),
+            ([1, 1, 2], [1, 1, 1], 2),
+            ([1, 1, 2], [1, 2], 1),
+            ([1, 1, 2], [2, 1], 1),
+            # Overlapping marker [A, B, A]: a completed [A, B] tail targets
+            # the closing ids[2]; a bare trailing A re-matches the 1-prefix
+            # and targets ids[1].
+            ([1, 2, 1], [1], 2),
+            ([1, 2, 1], [1, 2], 1),
+            ([1, 2, 1], [2, 1], 2),
+            ([1, 2, 1], [1, 2, 1], 2),
+        ],
+    )
+    def test_next_close_token_id_on_repeated_and_overlapping_markers(
+        self, end_ids, recent, expected
+    ):
+        """Pin the longest-proper-prefix resolution on markers with repeated
+        or overlapping ids: the biased token must always keep the generated
+        tail a valid marker prefix, never leak a fragment."""
+        proc = self._make_processor(end_ids=end_ids)
+        proc._recent_tokens = list(recent)
+        assert proc._next_close_token_id() == expected
+
+    def test_soft_zone_policy_constants(self):
+        """The zone boundaries are product choices, not incidental values:
+        the soft zone covers the last 50% of the budget, and FACTOR=2 makes
+        the close-think logit overtake the top halfway through the zone.
+        Changing either changes when models stop thinking; update the PR
+        narrative (and the vllm#38277 port) together with this test."""
+        assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.5
+        assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
+
+    def test_degenerate_budgets_keep_the_hard_cut_contract(self):
+        """Tiny budgets must degrade to the hard cut without a crash or a
+        dead zone: 0 and 1 force at the very first step, 2 has no usable
+        soft step before the wall."""
+        for budget in (0, 1):
+            proc = self._make_processor(budget=budget)
+            logits = self._step(proc, 1, self._ramp_logits())
+            assert proc._forcing
+            assert logits[0, self.THINK_END_ID].item() == 0.0
+            assert logits[0, 0].item() == float("-inf")
+
+        proc = self._make_processor(budget=2)
+        logits = self._step(proc, 1, self._ramp_logits())
+        assert not proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == 0.0  # no bias yet
+        self._step(proc, 2, self._ramp_logits())
+        assert proc._forcing
+
+    def test_budget_three_gets_one_soft_step(self):
+        """budget=3 is the smallest budget with a live soft step: step 2
+        runs the ramp at progress 1/2 (boost = FACTOR * gap * 1/2), step 3
+        is the hard wall."""
+        proc = self._make_processor(budget=3)
+        logits = self._step(proc, 1, _make_logits())
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+        # Flat logits: the gap floors at 1.0, so the boost is the pure ramp.
+        logits = self._step(proc, 2, _make_logits())
+        assert not proc._forcing
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * 0.5)
+        self._step(proc, 3, _make_logits())
+        assert proc._forcing
