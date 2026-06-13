@@ -10,7 +10,7 @@ their chain-of-thought reasoning in <think>...</think> tags.
 """
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import List, Optional, Tuple
 
 
@@ -25,6 +25,105 @@ _THINKING_PATTERN = re.compile(r'<think>(.*?)</think>', re.DOTALL)
 # Handle case where <think> is missing but </think> is present
 # (scheduler prepends <think>\n but the tag may be split)
 _THINKING_TAIL_PATTERN = re.compile(r'^(.*?)</think>', re.DOTALL)
+
+
+def _safe_tokenizer_attr(tokenizer, attr: str, default=None):
+    if tokenizer is None:
+        return default
+    try:
+        return getattr(tokenizer, attr, default)
+    except (AttributeError, TypeError, ValueError):
+        return default
+
+
+def _single_token_id(value) -> int | None:
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _convert_token_to_id(tokenizer, token: str) -> int | None:
+    convert = _safe_tokenizer_attr(tokenizer, "convert_tokens_to_ids")
+    if not callable(convert):
+        return None
+    try:
+        token_id = convert(token)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        return None
+    if token_id == _safe_tokenizer_attr(tokenizer, "unk_token_id"):
+        return None
+    return _single_token_id(token_id)
+
+
+def _encode_prompt_ids(tokenizer, prompt: str) -> list[int] | None:
+    encode = _safe_tokenizer_attr(tokenizer, "encode")
+    if not callable(encode):
+        return None
+    try:
+        return list(encode(prompt, add_special_tokens=False))
+    except TypeError:
+        try:
+            return list(encode(prompt))
+        except Exception:
+            return None
+    except Exception:
+        return None
+
+
+def prompt_opens_thinking(
+    tokenizer,
+    prompt: str,
+    prompt_token_ids: Sequence[int] | None = None,
+) -> tuple[bool, str]:
+    """Return whether a raw prompt would make the engine prepend ``<think>``.
+
+    Presentation-layer stripping must mirror the engine/scheduler decision, not
+    just the raw text suffix. Some prompts can contain a literal ``<think>``
+    without tokenizing to the model's think-start id, and templates can leave
+    the think-start token in the final token tail without the raw string ending
+    in the visible tag. When the caller already has prompt ids from the same
+    tokenizer path as the scheduler, those ids are authoritative.
+    """
+    think_tag = (
+        _safe_tokenizer_attr(tokenizer, "think_start", _OPEN_TAG) or _OPEN_TAG
+    )
+    if tokenizer is None:
+        return prompt.rstrip().endswith(think_tag), think_tag
+
+    think_start_id = _single_token_id(
+        _safe_tokenizer_attr(tokenizer, "think_start_id")
+    )
+    if think_start_id is None:
+        think_start_id = _convert_token_to_id(tokenizer, think_tag)
+    if think_start_id is None:
+        return False, think_tag
+
+    if prompt_token_ids is None:
+        prompt_ids = _encode_prompt_ids(tokenizer, prompt)
+    else:
+        prompt_ids = list(prompt_token_ids)
+    if not prompt_ids or not think_start_id:
+        return False, think_tag
+
+    last_tokens = list(prompt_ids[-3:])
+    if think_start_id not in last_tokens:
+        return False, think_tag
+
+    last_idx = len(last_tokens) - 1 - last_tokens[::-1].index(think_start_id)
+    after_start = last_tokens[last_idx + 1 :]
+
+    if after_start:
+        think_end_id = _single_token_id(_safe_tokenizer_attr(tokenizer, "think_end_id"))
+        if think_end_id is None:
+            think_end_tag = _safe_tokenizer_attr(tokenizer, "think_end", _CLOSE_TAG)
+            think_end_id = _convert_token_to_id(tokenizer, think_end_tag or _CLOSE_TAG)
+        if think_end_id is not None and think_end_id in after_start:
+            return False, think_tag
+
+    return True, think_tag
 
 
 def extract_thinking(text: str) -> Tuple[str, str]:
@@ -263,6 +362,12 @@ class ThinkingBudgetProcessor:
     exceeded, forces the close-think token(s) one at a time, then becomes
     a no-op for the rest of generation.
 
+    Includes a soft budget zone over the last 50% of the token budget:
+    instead of a single hard cut, the close-think logit is progressively
+    boosted relative to the model's own logit distribution, encouraging a
+    natural stopping point before the hard force at 100%. Mirrors vLLM's
+    soft thinking budget (vllm-project/vllm#38277).
+
     Handles both single-token and multi-token close-think sequences, and
     supports alternative think markers (e.g. ``<longcat_think>``).
 
@@ -270,7 +375,16 @@ class ThinkingBudgetProcessor:
         think_end_token_ids: Token ID(s) for the close-think tag.
         budget: Maximum number of thinking tokens before forcing close.
         think_start_token_id: Token ID for the open-think tag (re-entry detection).
+        soft_budget: Enable the progressive soft zone (default True).
     """
+
+    # Fraction of the budget where the soft zone begins (0.5 = last 50%).
+    # Tuned on local validation: an earlier zone closes thinking sooner at
+    # equal answer/recall quality, saving budget; see the PR for the sweep.
+    _SOFT_ZONE_START_FRAC = 0.5
+    # Multiplier on the measured gap; 2.0 makes the close-think logit
+    # dominate at 50% of the zone, 1.0 only reaches the top at 100%.
+    _SOFT_BIAS_FACTOR = 2.0
 
     def __init__(
         self,
@@ -280,6 +394,7 @@ class ThinkingBudgetProcessor:
         leading_token_ids: Optional[List[int]] = None,
         trailing_token_ids: Optional[List[int]] = None,
         token_to_piece: Optional[Callable[[int], str | bytes | None]] = None,
+        soft_budget: bool = True,
     ):
         self._think_end_ids = think_end_token_ids
         # Full force sequence: \n + </think> + \n\n (matches training pattern)
@@ -291,6 +406,11 @@ class ThinkingBudgetProcessor:
         self._budget = budget
         self._think_start_id = think_start_token_id
         self._token_to_piece = token_to_piece
+        self._soft_budget = soft_budget
+        self._soft_start = int(budget * self._SOFT_ZONE_START_FRAC) if budget > 0 else 0
+        # Invariant after construction; floored at 1 so tiny budgets cannot
+        # divide by zero in the progress computation.
+        self._soft_span = max(1, budget - self._soft_start)
 
         # State
         self._thinking_tokens: int = 0
@@ -339,8 +459,58 @@ class ThinkingBudgetProcessor:
                     return self._force_next_token(logits, mx)
                 self._waiting_utf8 = True
                 self._recent_tokens = []
+            elif self._soft_budget and self._thinking_tokens > self._soft_start:
+                return self._apply_soft_bias(logits, mx)
 
         return logits
+
+    def _apply_soft_bias(self, logits, mx):
+        """Progressively boost the close-think logit through the soft zone.
+
+        At each step, measure the gap between the top logit and the
+        close-think token, then raise the close-think logit toward (and
+        past) the top as the budget runs out::
+
+            target = end_logit + 2 * gap * progress
+
+        progress=0 leaves logits unchanged, 0.5 makes close-think equal to
+        the top logit, and 1.0 makes it dominate — so the model can close
+        the thinking block at a natural boundary instead of being cut
+        mid-sentence by the hard force.
+
+        The whole path stays in lazy MLX array ops — no ``.item()``/eval,
+        so the decode loop never syncs on this bias (``progress`` comes
+        from Python-side counters). Only the *next valid* token of the
+        close marker is boosted; for multi-token markers, boosting later
+        ids could make the model sample them out of order and leak a
+        marker fragment into the thinking text.
+        """
+        progress = (self._thinking_tokens - self._soft_start) / self._soft_span
+        next_id = self._next_close_token_id()
+        top_logit = mx.max(logits, axis=-1, keepdims=True)
+        end_logit = logits[..., next_id : next_id + 1]
+        gap = mx.maximum(top_logit - end_logit, 1.0)
+        target = end_logit + self._SOFT_BIAS_FACTOR * progress * gap
+        logits[..., next_id : next_id + 1] = mx.maximum(end_logit, target)
+        return logits
+
+    def _next_close_token_id(self) -> int:
+        """The only close-marker token that is valid to sample next.
+
+        For a multi-token close marker, the model must emit the ids in
+        order; if the tail of recently generated tokens already matches a
+        proper prefix of the marker, the next id of the sequence is the
+        one to encourage. Otherwise (and always for single-token markers)
+        it is the first id.
+        """
+        ids = self._think_end_ids
+        if len(ids) == 1:
+            return ids[0]
+        recent = self._recent_tokens
+        for k in range(min(len(recent), len(ids) - 1), 0, -1):
+            if recent[-k:] == ids[:k]:
+                return ids[k]
+        return ids[0]
 
     def _update_state(self, token_id: int) -> None:
         """Update thinking state based on the last generated token."""
