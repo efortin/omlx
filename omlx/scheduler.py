@@ -600,6 +600,21 @@ def _patched_generation_batch_step(self):
     # See #934 / #1747.
     _omlx_realign_generation_batch_rows(self)
 
+    # Realign per-row samplers and logits processors with ``uids`` from the
+    # per-uid registry; stale or offset slots left by batch extend/filter/
+    # split would otherwise run another request's — or no — rows. See #1823.
+    new_samplers, new_lps, drift = _realigned_rows(
+        getattr(self, "model", None),
+        self.uids,
+        getattr(self, "samplers", None) or [],
+        self.logits_processors,
+    )
+    if drift:
+        _log_drift_correction(self.uids, len(self.logits_processors))
+    self.logits_processors = new_lps
+    self.samplers = new_samplers
+
+
     result = _original_generation_batch_step(self)
 
     # self._next_tokens contains the just-sampled tokens (async eval pending).
