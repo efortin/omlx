@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for ThinkingBudgetProcessor logits processor."""
 
+import math
 from unittest.mock import MagicMock
 
 import pytest
@@ -434,15 +435,16 @@ class TestResolveThinkingBudget:
 
 @pytest.mark.skipif(not HAS_MLX, reason="mlx not available")
 class TestSoftThinkingBudget:
-    """Unit tests for the progressive soft budget zone (vllm#38277 port)."""
+    """Unit tests for the progressive soft budget zone."""
 
     THINK_END_ID = 42
     THINK_START_ID = 41
     BUDGET = 10
     FRAC = ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC
-    FACTOR = ThinkingBudgetProcessor._SOFT_BIAS_FACTOR
+    CENTER = 0.8
+    SHARPNESS = 10.0
+    TARGET_MARGIN = 0.25
     SOFT_START = int(BUDGET * FRAC)
-    SPAN = BUDGET - SOFT_START
 
     def _make_processor(self, budget: int = None, soft_budget: bool = True, end_ids=None):
         return ThinkingBudgetProcessor(
@@ -452,10 +454,47 @@ class TestSoftThinkingBudget:
             soft_budget=soft_budget,
         )
 
-    def _ramp_logits(self, vocab_size: int = 100, top_id: int = 7, top: float = 5.0):
-        """Logits with a known top value and zeros elsewhere."""
+    def _ramp_logits(
+        self,
+        vocab_size: int = 100,
+        top_id: int = 7,
+        top: float = 5.0,
+        end: float = 0.0,
+    ):
+        """Logits with known top and close-think values."""
         logits = mx.zeros((1, vocab_size))
         logits[0, top_id] = top
+        logits[0, self.THINK_END_ID] = end
+        return logits
+
+    def _ranked_logits(
+        self,
+        *,
+        end: float,
+        top: float = 40.0,
+        above_end_count: int = 31,
+        vocab_size: int = 100,
+    ):
+        """Logits where the close token has a controlled rank."""
+        logits = mx.zeros((1, vocab_size))
+        for rank in range(above_end_count):
+            logits[0, rank] = top - (top - end) * rank / max(above_end_count, 1)
+        logits[0, self.THINK_END_ID] = end
+        return logits
+
+    def _many_candidates_above_close_logits(
+        self,
+        *,
+        end: float = 20.0,
+        top: float = 40.0,
+        step: float = 0.5,
+        vocab_size: int = 100,
+    ):
+        """Logits with many plausible tokens above the close token."""
+        logits = mx.zeros((1, vocab_size))
+        for rank in range(32):
+            logits[0, rank] = top - step * rank
+        logits[0, self.THINK_END_ID] = end
         return logits
 
     def _step(self, proc, n_tokens: int, logits=None):
@@ -463,12 +502,26 @@ class TestSoftThinkingBudget:
         tokens = _make_tokens(*range(10, 10 + n_tokens))
         return proc(tokens, logits if logits is not None else _make_logits())
 
-    def _expected_boost(self, step: int, top: float = 5.0) -> float:
-        """target - end_logit for a zeroed end logit at a given think step."""
-        if step <= self.SOFT_START:
-            return 0.0
-        progress = (step - self.SOFT_START) / max(1, self.SPAN)
-        return self.FACTOR * max(top, 1.0) * progress
+    def _expected_end_logit(
+        self,
+        step: int,
+        end: float = 0.0,
+        top: float = 5.0,
+        budget: int = None,
+    ) -> float:
+        """Expected close-think logit at a given think step."""
+        budget = self.BUDGET if budget is None else budget
+        soft_start = int(budget * self.FRAC)
+        if step <= soft_start:
+            return end
+        soft_steps = max(1, budget - soft_start - 1)
+        progress = min(max((step - soft_start) / soft_steps, 0.0), 1.0)
+        start = 1.0 / (1.0 + math.exp(-self.SHARPNESS * (0.0 - self.CENTER)))
+        finish = 1.0 / (1.0 + math.exp(-self.SHARPNESS * (1.0 - self.CENTER)))
+        value = 1.0 / (1.0 + math.exp(-self.SHARPNESS * (progress - self.CENTER)))
+        ramp = (value - start) / max(finish - start, 1e-6)
+        target = end + ramp * ((top - self.TARGET_MARGIN) - end)
+        return max(end, target)
 
     def test_no_bias_before_soft_zone(self):
         """Up to the zone boundary, logits pass through unchanged."""
@@ -479,7 +532,7 @@ class TestSoftThinkingBudget:
         assert not proc._forcing
 
     def test_soft_zone_boosts_end_logit_progressively(self):
-        """Inside the soft zone the close-think logit ramps toward the top."""
+        """Inside the soft zone a plausible close-think logit ramps up."""
         proc = self._make_processor()
         boosts = []
         for step in range(1, self.BUDGET):
@@ -487,16 +540,85 @@ class TestSoftThinkingBudget:
             boosts.append(logits[0, self.THINK_END_ID].item())
         assert boosts[self.SOFT_START - 1] == 0.0  # boundary step: progress=0
         for step in range(self.SOFT_START + 1, self.BUDGET):
-            assert boosts[step - 1] == pytest.approx(self._expected_boost(step))
+            assert boosts[step - 1] == pytest.approx(self._expected_end_logit(step))
         assert boosts[self.BUDGET - 2] > boosts[self.SOFT_START]
 
-    def test_soft_zone_end_dominates_at_high_progress(self):
-        """Past 1/FACTOR of the soft zone the close-think logit exceeds the top."""
+    def test_soft_zone_uses_sigmoid_top_margin_target(self):
+        """The soft nudge pulls near, but not above, the top logit."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
-            logits = self._step(proc, step, self._ramp_logits(top=5.0))
-        assert logits[0, self.THINK_END_ID].item() > 5.0
+            logits = self._step(proc, step, self._ramp_logits(top=5.0, end=0.0))
+        target = self._expected_end_logit(self.BUDGET - 1, top=5.0, end=0.0)
+        assert target == pytest.approx(4.75)
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(target)
+        assert logits[0, self.THINK_END_ID].item() < logits[0, 7].item()
+
+    def test_soft_zone_boost_scales_with_gap_to_top(self):
+        """Far-away close tokens get a larger absolute boost."""
+        proc = self._make_processor()
+        logits = None
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._many_candidates_above_close_logits())
+        target = self._expected_end_logit(
+            self.BUDGET - 1,
+            end=20.0,
+            top=40.0,
+        )
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(target)
+
+    def test_soft_zone_farther_close_token_gets_stronger_absolute_boost(self):
+        """The target is top-relative, not a fixed offset."""
+        near_proc = self._make_processor()
+        far_proc = self._make_processor()
+        near_logits = far_logits = None
+        for step in range(1, self.BUDGET):
+            near_logits = self._step(
+                near_proc,
+                step,
+                self._many_candidates_above_close_logits(),
+            )
+            far_logits = self._step(
+                far_proc,
+                step,
+                self._many_candidates_above_close_logits(end=5.0),
+            )
+
+        near_boost = near_logits[0, self.THINK_END_ID].item() - 20.0
+        far_boost = far_logits[0, self.THINK_END_ID].item() - 5.0
+        assert far_boost > near_boost
+        assert near_logits[0, self.THINK_END_ID].item() == pytest.approx(39.75)
+        assert far_logits[0, self.THINK_END_ID].item() == pytest.approx(39.75)
+
+    def test_soft_zone_never_overtakes_top_before_hard_cut(self):
+        """The soft path must not become a temperature-0 hard force."""
+        proc = self._make_processor()
+        logits = None
+        for step in range(1, self.BUDGET):
+            logits = self._step(proc, step, self._ramp_logits(top=10.0, end=-20.0))
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(9.75)
+        assert logits[0, self.THINK_END_ID].item() < logits[0, 7].item()
+
+    def test_soft_zone_prefers_near_top_close_token_before_saturation(self):
+        """Before the ramp saturates, near-top close tokens stay more natural."""
+        near_proc = self._make_processor()
+        edge_proc = self._make_processor()
+        target_step = self.SOFT_START + 1
+        for step in range(1, target_step + 1):
+            near_logits = self._step(
+                near_proc,
+                step,
+                self._ranked_logits(end=39.0, top=40.0, above_end_count=10),
+            )
+            edge_logits = self._step(
+                edge_proc,
+                step,
+                self._ranked_logits(end=10.0, top=40.0, above_end_count=31),
+            )
+        assert near_logits[0, self.THINK_END_ID].item() > edge_logits[
+            0, self.THINK_END_ID
+        ].item()
+        assert edge_logits[0, self.THINK_END_ID].item() > 10.0
 
     def test_hard_force_still_applies_at_budget(self):
         """The 100% hard force stays as the safety net."""
@@ -540,7 +662,7 @@ class TestSoftThinkingBudget:
         logits = None
         for step in range(1, self.BUDGET):
             logits = self._step(proc, step, self._ramp_logits(top=5.0))
-        target = self._expected_boost(self.BUDGET - 1)
+        target = self._expected_end_logit(self.BUDGET - 1)
         assert logits[0, 42].item() == pytest.approx(target)
         assert logits[0, 43].item() == 0.0
 
@@ -558,14 +680,13 @@ class TestSoftThinkingBudget:
         assert logits[0, 43].item() > 0.0  # continuation id boosted
         assert logits[0, 42].item() == 0.0  # first id no longer targeted
 
-    def test_min_gap_floor_when_end_already_near_top(self):
-        """gap is floored at 1.0 so the ramp still progresses on flat logits."""
+    def test_flat_logits_are_not_penalized_or_forced_by_soft_zone(self):
+        """Flat logits already leave the close token tied with the top."""
         proc = self._make_processor()
         logits = None
         for step in range(1, self.BUDGET):
-            logits = self._step(proc, step, _make_logits())  # all zeros, gap->1.0
-        progress = (self.BUDGET - 1 - self.SOFT_START) / max(1, self.SPAN)
-        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * progress)
+            logits = self._step(proc, step, _make_logits())
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(0.0)
 
     def test_multi_token_wrong_prefix_falls_back_to_first_id(self):
         """A generated tail that matches a LATER marker id (not a proper
@@ -614,16 +735,17 @@ class TestSoftThinkingBudget:
 
     def test_soft_zone_policy_constants(self):
         """The zone boundaries are product choices, not incidental values:
-        the soft zone covers the last 50% of the budget, and FACTOR=2 makes
-        the close-think logit overtake the top halfway through the zone.
-        Changing either changes when models stop thinking; update the PR
-        narrative (and the vllm#38277 port) together with this test."""
-        assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.5
-        assert ThinkingBudgetProcessor._SOFT_BIAS_FACTOR == 2.0
+        the soft zone covers the last 30% of the budget and uses a late
+        sigmoid pull toward the top logit. Changing these values changes when
+        models stop thinking; update the PR narrative together with this test."""
+        assert ThinkingBudgetProcessor._SOFT_ZONE_START_FRAC == 0.7
+        assert ThinkingBudgetProcessor._SOFT_SIGMOID_CENTER == 0.8
+        assert ThinkingBudgetProcessor._SOFT_SIGMOID_SHARPNESS == 10.0
+        assert ThinkingBudgetProcessor._SOFT_TARGET_MARGIN == 0.25
 
     def test_degenerate_budgets_keep_the_hard_cut_contract(self):
         """Tiny budgets must degrade to the hard cut without a crash or a
-        dead zone: 0 and 1 force at the very first step, 2 has no usable
+        dead zone: 0 and 1 force at the very first step, 2 and 3 have no usable
         soft step before the wall."""
         for budget in (0, 1):
             proc = self._make_processor(budget=budget)
@@ -632,25 +754,30 @@ class TestSoftThinkingBudget:
             assert logits[0, self.THINK_END_ID].item() == 0.0
             assert logits[0, 0].item() == float("-inf")
 
-        proc = self._make_processor(budget=2)
-        logits = self._step(proc, 1, self._ramp_logits())
-        assert not proc._forcing
-        assert logits[0, self.THINK_END_ID].item() == 0.0  # no bias yet
-        self._step(proc, 2, self._ramp_logits())
-        assert proc._forcing
+        for budget in (2, 3):
+            proc = self._make_processor(budget=budget)
+            for step in range(1, budget):
+                logits = self._step(proc, step, self._ramp_logits())
+                assert not proc._forcing
+                assert logits[0, self.THINK_END_ID].item() == 0.0  # no bias yet
+            self._step(proc, budget, self._ramp_logits())
+            assert proc._forcing
 
-    def test_budget_three_gets_one_soft_step(self):
-        """budget=3 is the smallest budget with a live soft step: step 2
-        runs the ramp at progress 1/2 (boost = FACTOR * gap * 1/2), step 3
+    def test_budget_four_gets_one_soft_step(self):
+        """budget=4 is the smallest budget with a live soft step: step 3
+        runs the ramp at progress 1/2, step 4
         is the hard wall."""
-        proc = self._make_processor(budget=3)
+        proc = self._make_processor(budget=4)
         logits = self._step(proc, 1, _make_logits())
         assert logits[0, self.THINK_END_ID].item() == 0.0
-        # Flat logits: the gap floors at 1.0, so the boost is the pure ramp.
         logits = self._step(proc, 2, _make_logits())
+        assert logits[0, self.THINK_END_ID].item() == 0.0
+        # Flat logits already tie the close token with the top, so the soft
+        # path leaves them unchanged rather than manufacturing a forced close.
+        logits = self._step(proc, 3, _make_logits())
         assert not proc._forcing
-        assert logits[0, self.THINK_END_ID].item() == pytest.approx(self.FACTOR * 1.0 * 0.5)
-        self._step(proc, 3, _make_logits())
+        assert logits[0, self.THINK_END_ID].item() == pytest.approx(0.0)
+        self._step(proc, 4, _make_logits())
         assert proc._forcing
 
 
@@ -678,8 +805,13 @@ class TestCompletionsThinkingBudget:
 
     @staticmethod
     def _engine_call_passes_budget(handler_name: str, engine_method: str) -> bool:
-        """True when ``handler_name`` calls ``<obj>.<engine_method>(...)`` with
-        a ``thinking_budget`` keyword built from ``_resolve_thinking_budget``.
+        """True when ``handler_name`` threads a ``thinking_budget`` resolved from
+        ``_resolve_thinking_budget`` into ``<obj>.<engine_method>(...)``.
+
+        Accepts both wirings: the inline ``thinking_budget=_resolve_thinking_budget(...)``
+        keyword and the ``**gen_kwargs`` dict-unpack pattern the chat path uses
+        (#1844), where the handler sets ``gen_kwargs["thinking_budget"]`` from the
+        resolved value and unpacks the dict into the engine call.
 
         Structural AST check: immune to reformatting, wrappers, and comments,
         unlike substring counting."""
@@ -689,28 +821,71 @@ class TestCompletionsThinkingBudget:
         source = (
             Path(__file__).resolve().parents[1] / "omlx" / "server.py"
         ).read_text()
+
+        def _is_resolve_call(value) -> bool:
+            return (
+                isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Name)
+                and value.func.id == "_resolve_thinking_budget"
+            )
+
         for node in ast.walk(ast.parse(source)):
-            if (
+            if not (
                 isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
                 and node.name == handler_name
             ):
-                for call in ast.walk(node):
-                    if not isinstance(call, ast.Call):
-                        continue
-                    func = call.func
-                    if not (isinstance(func, ast.Attribute) and func.attr == engine_method):
-                        continue
-                    for keyword in call.keywords:
-                        if keyword.arg != "thinking_budget":
-                            continue
-                        value = keyword.value
-                        if (
-                            isinstance(value, ast.Call)
-                            and isinstance(value.func, ast.Name)
-                            and value.func.id == "_resolve_thinking_budget"
-                        ):
-                            return True
+                continue
+
+            # Locals bound directly to _resolve_thinking_budget(...), e.g.
+            #     thinking_budget = _resolve_thinking_budget(request, request.model)
+            resolved_locals = {
+                t.id
+                for n in ast.walk(node)
+                if isinstance(n, ast.Assign) and _is_resolve_call(n.value)
+                for t in n.targets
+                if isinstance(t, ast.Name)
+            }
+            # Dicts that get a "thinking_budget" entry from the resolved value, e.g.
+            #     gen_kwargs["thinking_budget"] = thinking_budget
+            budget_dicts = set()
+            for n in ast.walk(node):
+                if not isinstance(n, ast.Assign):
+                    continue
+                for t in n.targets:
+                    if (
+                        isinstance(t, ast.Subscript)
+                        and isinstance(t.value, ast.Name)
+                        and isinstance(t.slice, ast.Constant)
+                        and t.slice.value == "thinking_budget"
+                        and (
+                            _is_resolve_call(n.value)
+                            or (
+                                isinstance(n.value, ast.Name)
+                                and n.value.id in resolved_locals
+                            )
+                        )
+                    ):
+                        budget_dicts.add(t.value.id)
+
+            for call in ast.walk(node):
+                if not isinstance(call, ast.Call):
+                    continue
+                func = call.func
+                if not (isinstance(func, ast.Attribute) and func.attr == engine_method):
+                    continue
+                for keyword in call.keywords:
+                    # inline: engine.generate(..., thinking_budget=_resolve_thinking_budget(...))
+                    if keyword.arg == "thinking_budget" and _is_resolve_call(keyword.value):
+                        return True
+                    # dict-unpack: engine.generate(..., **gen_kwargs)
+                    if (
+                        keyword.arg is None
+                        and isinstance(keyword.value, ast.Name)
+                        and keyword.value.id in budget_dicts
+                    ):
+                        return True
                 return False
+            return False
         raise AssertionError(f"{handler_name} not found in server.py")
 
     def test_non_streaming_completion_path_resolves_the_budget(self):
@@ -853,6 +1028,30 @@ class TestCompletionsStreamThinkPrefixParity:
             think_end_id = 42
 
             def encode(self, prompt, add_special_tokens=False):
+                return [41, 42]
+
+        opens, tag = prompt_opens_thinking(Tokenizer(), "<think></think>")
+
+        assert (opens, tag) == (False, "<think>")
+
+    def test_prompt_detection_rejects_multi_token_disabled_thinking_pattern(self):
+        """Mirror the scheduler's encode(think_end) fallback: when the close
+        marker is multi-token, seeing its first token after <think> still means
+        the prompt disabled thinking."""
+        from omlx.api.thinking import prompt_opens_thinking
+
+        class Tokenizer:
+            think_start = "<think>"
+            think_start_id = 41
+            think_end = "</think>"
+            unk_token_id = 0
+
+            def convert_tokens_to_ids(self, token):
+                return self.unk_token_id
+
+            def encode(self, prompt, add_special_tokens=False):
+                if prompt == self.think_end:
+                    return [42, 43]
                 return [41, 42]
 
         opens, tag = prompt_opens_thinking(Tokenizer(), "<think></think>")
